@@ -421,11 +421,12 @@ jobs:
 
           mkdir -p "/etc/systemd/system/\$GUNICORN_SERVICE.service.d"
 
+          # EFS 마운트 실패/지연이 Gunicorn 자체 시작을 막지 않도록
+          # RequiresMountsFor는 사용하지 않는다.
           cat > "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf" <<EOF_SYSTEMD
           [Unit]
           Wants=network-online.target remote-fs.target
           After=network-online.target remote-fs.target
-          RequiresMountsFor=\$EFS_MOUNT_POINT
           EOF_SYSTEMD
 
           systemctl daemon-reload
@@ -944,6 +945,110 @@ jobs:
           exit 1
 
       # ----------------------------------------------------------
+      # Refresh로 새로 생성된 인스턴스에서 Gunicorn/EFS 상태 확인
+      # ----------------------------------------------------------
+      - name: Validate refreshed instances
+        id: validate_refreshed_instances
+        shell: bash
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+        run: |
+          set -Eeuo pipefail
+
+          NEW_INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
+            --output text)
+
+          if [ -z "$NEW_INSTANCE_IDS" ] || [ "$NEW_INSTANCE_IDS" = "None" ]; then
+            echo "Refresh 후 InService 인스턴스를 찾지 못했습니다."
+            exit 1
+          fi
+
+          read -r -d '' REMOTE_SCRIPT <<SCRIPT || true
+          set -Eeuo pipefail
+
+          echo "========================================"
+          echo "서버: \$(hostname)"
+          echo "Refresh 후 서비스 상태 확인"
+          echo "========================================"
+
+          echo "[1/4] Gunicorn 상태"
+          systemctl is-active --quiet "$GUNICORN_SERVICE"
+          systemctl status "$GUNICORN_SERVICE" --no-pager
+
+          echo "[2/4] 8000 포트 확인"
+          ss -lntp | grep ':8000'
+
+          echo "[3/4] 로컬 HTTP 확인"
+          curl -fsS http://127.0.0.1:8000/ >/dev/null
+
+          echo "[4/4] EFS 상태 확인"
+          if mountpoint -q "$EFS_MOUNT_POINT"; then
+            findmnt "$EFS_MOUNT_POINT"
+          else
+            echo "EFS는 아직 마운트되지 않았습니다."
+            echo "x-systemd.automount가 설정되어 있으므로 media 경로 접근 시 마운트를 시도합니다."
+          fi
+          SCRIPT
+
+          PARAMETERS=$(jq -n \
+            --arg command "$REMOTE_SCRIPT" \
+            '{commands: [$command]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids $NEW_INSTANCE_IDS \
+            --document-name "AWS-RunShellScript" \
+            --comment "Validate refreshed mysite instances" \
+            --timeout-seconds 300 \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          FAILED=0
+
+          for INSTANCE_ID in $NEW_INSTANCE_IDS; do
+            aws ssm wait command-executed \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" || true
+
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text)
+
+            echo "$INSTANCE_ID: $STATUS"
+
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "StandardOutputContent" \
+              --output text || true
+
+            if [ "$STATUS" != "Success" ]; then
+              FAILED=1
+
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardErrorContent" \
+                --output text || true
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Refresh 후 인스턴스 검증에 실패했습니다."
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
       # 최종 ASG 상태 확인
       # Target Tracking에 의해 최종 Desired는 2~4 사이일 수 있다.
       # ----------------------------------------------------------
@@ -1002,5 +1107,6 @@ jobs:
             echo "- collectstatic / S3 sync: 완료"
             echo "- DesiredConfiguration 적용: 완료"
             echo "- AutoRollback: 활성"
+            echo "- Gunicorn/EFS 부팅 의존성: 비차단 구성"
             echo "- ASG 롤링 교체: 완료"
           } >> "$GITHUB_STEP_SUMMARY"
