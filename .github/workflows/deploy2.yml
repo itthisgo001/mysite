@@ -151,7 +151,6 @@ jobs:
       - name: Validate deployment secrets
         shell: bash
         env:
-          EFS_ENDPOINT: ${{ secrets.EFS_ENDPOINT }}
           LAUNCH_TEMPLATE_ID: ${{ secrets.LAUNCH_TEMPLATE_ID }}
           ASG_NAME: ${{ secrets.ASG_NAME }}
         run: |
@@ -364,7 +363,7 @@ jobs:
           rm -f /tmp/production.env
 
       # ----------------------------------------------------------
-      # 현재 ASG EC2 전체에 새 코드/.env/EFS 설정 적용
+      # 현재 ASG EC2 전체에 새 코드/.env 적용 및 EFS automount 검증
       # ----------------------------------------------------------
       - name: Update application on current ASG instances
         id: update_application
@@ -372,7 +371,6 @@ jobs:
         env:
           INSTANCE_IDS: ${{ steps.asg_instances.outputs.instance_ids }}
           PRODUCTION_ENV_BASE64: ${{ steps.production_env.outputs.base64 }}
-          EFS_ENDPOINT: ${{ secrets.EFS_ENDPOINT }}
         run: |
           set -Eeuo pipefail
 
@@ -383,7 +381,6 @@ jobs:
           VENV_DIR="$VENV_DIR"
           GIT_REPOSITORY="$GIT_REPOSITORY"
           GUNICORN_SERVICE="$GUNICORN_SERVICE"
-          EFS_ENDPOINT="$EFS_ENDPOINT"
           EFS_MOUNT_POINT="$EFS_MOUNT_POINT"
           ENV_FILE="\$PROJECT_DIR/.env"
 
@@ -392,64 +389,70 @@ jobs:
           echo "Django 애플리케이션 갱신"
           echo "========================================"
 
-          if ! command -v mount.nfs4 >/dev/null 2>&1; then
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common
-          fi
+          echo "[EFS-1] EFS 마운트 경로 확인"
 
-          if [ -e "\$EFS_MOUNT_POINT" ] && [ ! -d "\$EFS_MOUNT_POINT" ]; then
-            echo "EFS 마운트 경로가 디렉터리가 아닙니다: \$EFS_MOUNT_POINT"
-            ls -ld "\$EFS_MOUNT_POINT"
+          if [ ! -d "\$EFS_MOUNT_POINT" ]; then
+            echo "EFS 마운트 경로가 없습니다: \$EFS_MOUNT_POINT"
+            echo "AMI에 EFS 마운트 디렉터리와 /etc/fstab 설정이 포함되어 있어야 합니다."
             exit 1
           fi
 
-          mkdir -p "\$EFS_MOUNT_POINT"
+          echo "[EFS-2] /etc/fstab EFS 설정 확인"
 
-          EFS_HOST="\${EFS_ENDPOINT%%:*}"
-          EFS_SOURCE="\${EFS_HOST}:/"
-          FSTAB_OPTIONS="nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev,nofail,x-systemd.automount"
-          FSTAB_ENTRY="\$EFS_SOURCE \$EFS_MOUNT_POINT nfs4 \$FSTAB_OPTIONS 0 0"
+          if ! grep -Fq "\$EFS_MOUNT_POINT" /etc/fstab; then
+            echo "/etc/fstab에 EFS 마운트 설정이 없습니다: \$EFS_MOUNT_POINT"
+            exit 1
+          fi
 
-          cp /etc/fstab "/etc/fstab.backup.\$(date +%Y%m%d%H%M%S)"
-          sed -i "\|[[:space:]]\$EFS_MOUNT_POINT[[:space:]]|d" /etc/fstab
-          printf '%s\n' "\$FSTAB_ENTRY" >> /etc/fstab
+          echo "[EFS-3] systemd automount 구성 다시 읽기"
 
           systemctl daemon-reload
 
-          # x-systemd.automount 사용:
-          # 여기서는 수동 mount를 실행하지 않는다.
-          # 경로에 실제 접근하는 시점에 systemd가 자동 마운트를 수행한다.
           AUTOMOUNT_UNIT="\$(systemd-escape --path "\$EFS_MOUNT_POINT").automount"
 
-          echo "EFS automount unit 확인: \$AUTOMOUNT_UNIT"
+          echo "Automount unit: \$AUTOMOUNT_UNIT"
 
-          if systemctl list-unit-files "\$AUTOMOUNT_UNIT" >/dev/null 2>&1; then
-            systemctl start "\$AUTOMOUNT_UNIT" || true
+          if ! systemctl list-unit-files "\$AUTOMOUNT_UNIT" --no-legend 2>/dev/null | grep -q "\$AUTOMOUNT_UNIT"; then
+            echo "systemd automount unit을 찾지 못했습니다: \$AUTOMOUNT_UNIT"
+            echo "/etc/fstab에 x-systemd.automount 옵션이 있는지 확인하세요."
+            grep -F "\$EFS_MOUNT_POINT" /etc/fstab || true
+            exit 1
           fi
 
-          # automount 트리거용 경로 접근
+          echo "[EFS-4] automount unit 시작"
+
+          systemctl start "\$AUTOMOUNT_UNIT"
+
+          echo "[EFS-5] 경로 접근으로 automount 트리거"
+
           ls "\$EFS_MOUNT_POINT" >/dev/null
 
+          echo "[EFS-6] EFS 마운트 검증"
+
           if ! mountpoint -q "\$EFS_MOUNT_POINT"; then
-            echo "EFS automount 실패: \$EFS_SOURCE -> \$EFS_MOUNT_POINT"
+            echo "EFS automount 실패: \$EFS_MOUNT_POINT"
             systemctl status "\$AUTOMOUNT_UNIT" --no-pager || true
             findmnt "\$EFS_MOUNT_POINT" || true
+            grep -F "\$EFS_MOUNT_POINT" /etc/fstab || true
             exit 1
           fi
 
           findmnt "\$EFS_MOUNT_POINT"
 
-          mkdir -p "/etc/systemd/system/\$GUNICORN_SERVICE.service.d"
+          echo "[EFS-7] Gunicorn drop-in 확인"
 
-          # EFS 마운트 실패/지연이 Gunicorn 자체 시작을 막지 않도록
-          # RequiresMountsFor는 사용하지 않는다.
-          cat > "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf" <<EOF_SYSTEMD
-          [Unit]
-          Wants=network-online.target remote-fs.target
-          After=network-online.target remote-fs.target
-          EOF_SYSTEMD
+          if [ -f "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf" ]; then
+            echo "Gunicorn EFS drop-in:"
+            cat "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf"
 
-          systemctl daemon-reload
+            if grep -q "RequiresMountsFor" "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf"; then
+              echo "RequiresMountsFor가 남아 있습니다."
+              echo "AMI에서 해당 설정을 제거한 뒤 새 AMI를 생성해야 합니다."
+              exit 1
+            fi
+          else
+            echo "Gunicorn EFS drop-in 없음: 정상"
+          fi
 
           if [ ! -d "\$PROJECT_DIR/.git" ]; then
             echo "Git 프로젝트가 없습니다: \$PROJECT_DIR"
@@ -1305,7 +1308,7 @@ jobs:
             echo "- DesiredConfiguration 적용: 완료"
             echo "- AutoRollback: 활성"
             echo "- Gunicorn/EFS 부팅 의존성: 비차단 구성"
-            echo "- EFS 마운트 방식: x-systemd.automount (수동 mount 미사용)"
+            echo "- EFS: AMI의 /etc/fstab + x-systemd.automount 설정 검증"
             echo "- SSM 결과 확인: 최대 20분 polling 방식"
             echo "- ASG 롤링 교체: 완료"
           } >> "$GITHUB_STEP_SUMMARY"
