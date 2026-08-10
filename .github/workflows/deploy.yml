@@ -24,7 +24,7 @@ env:
   ENVIRONMENT_TAG: production
 
   # 배포 대상 GitHub 저장소
-  GIT_REPOSITORY: https://github.com/자신의GITHUB저장소/mysite.git
+  GIT_REPOSITORY: https://github.com/itthisgo001/mysite.git
 
   # EC2 내부 경로
   PROJECT_DIR: /home/ubuntu/djangowork/mysite
@@ -37,7 +37,7 @@ env:
   EFS_MOUNT_POINT: /srv/efs/mysite/media
 
   # Django collectstatic 결과 업로드 위치
-  S3_STATIC_URI: s3://mysite-cdn-bucket-7*****76-ap-northeast-2-an/static
+  S3_STATIC_URI: s3://mysite-cdn-bucket-731219765076-ap-northeast-2-an/static
 
 jobs:
   # ============================================================
