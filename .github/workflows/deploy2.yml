@@ -1,0 +1,999 @@
+name: Test, Bake AMI, and Rolling Deploy Django
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mysite-production-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+
+  # GitHub 저장소
+  GIT_REPOSITORY: https://github.com/itthisgo001/mysite.git
+
+  # EC2 내부 경로
+  PROJECT_DIR: /home/ubuntu/djangowork/mysite
+  VENV_DIR: /home/ubuntu/djangowork/workenv
+  GUNICORN_SERVICE: gunicorn
+
+  # EFS
+  EFS_MOUNT_POINT: /srv/efs/mysite/media
+
+  # collectstatic 결과 업로드 위치
+  S3_STATIC_URI: s3://mysite-cdn-bucket-731219765076-ap-northeast-2-an/static
+
+jobs:
+  # ============================================================
+  # 1. CI - Django 테스트
+  # ============================================================
+  test:
+    name: Run Django Tests
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_DATABASE: testdb
+          MARIADB_USER: tester
+          MARIADB_PASSWORD: test-password
+          MARIADB_ROOT_PASSWORD: root-test-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install MariaDB build packages
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            default-libmysqlclient-dev
+
+      - name: Install Python dependencies
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create test environment file
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cat > .env <<'EOF_ENV'
+          DJANGO_SECRET_KEY="github-actions-test-secret-key"
+          DJANGO_DEBUG="False"
+          DJANGO_ALLOWED_HOSTS="localhost,127.0.0.1,testserver"
+
+          DB_ENGINE="django.db.backends.mysql"
+          DB_NAME="testdb"
+          DB_USER="tester"
+          DB_PASSWORD="test-password"
+          DB_HOST="127.0.0.1"
+          DB_PORT="3306"
+
+          STATIC_URL="/static/"
+          STATIC_ROOT="staticfiles"
+          MEDIA_ROOT="/tmp/mysite/media/"
+          EOF_ENV
+
+          mkdir -p /tmp/mysite/media
+          chmod 600 .env
+
+      - name: Check Django configuration
+        run: |
+          set -Eeuo pipefail
+          python manage.py check
+
+      - name: Check missing migrations
+        run: |
+          set -Eeuo pipefail
+          python manage.py makemigrations --check --dry-run
+
+      - name: Run Django tests
+        run: |
+          set -Eeuo pipefail
+          python manage.py test board --verbosity 2
+
+  # ============================================================
+  # 2. CD - 현재 ASG 인스턴스에 새 코드 반영
+  # ============================================================
+  deploy:
+    name: Deploy and Refresh ASG
+    runs-on: ubuntu-latest
+    needs: test
+    environment: production
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: |
+          set -Eeuo pipefail
+          aws sts get-caller-identity
+
+      # ----------------------------------------------------------
+      # 배포에 필요한 Secret 확인
+      # ----------------------------------------------------------
+      - name: Validate deployment secrets
+        shell: bash
+        env:
+          EFS_ENDPOINT: ${{ secrets.EFS_ENDPOINT }}
+          LAUNCH_TEMPLATE_ID: ${{ secrets.LAUNCH_TEMPLATE_ID }}
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+        run: |
+          set -Eeuo pipefail
+
+          for NAME in EFS_ENDPOINT LAUNCH_TEMPLATE_ID ASG_NAME; do
+            if [ -z "${!NAME:-}" ]; then
+              echo "필수 GitHub Secret이 비어 있습니다: $NAME"
+              exit 1
+            fi
+          done
+
+      # ----------------------------------------------------------
+      # ASG 설정 확인
+      #
+      # 현재 구성:
+      # Min     = 2
+      # Desired = 2
+      # Max     = 4
+      #
+      # Target Tracking:
+      # Average CPU Utilization = 30%
+      # Warmup = 10초
+      # Scale-in = 활성
+      #
+      # 이 워크플로는 위 용량/스케일링 정책을 변경하지 않는다.
+      # ----------------------------------------------------------
+      - name: Verify ASG configuration
+        id: asg_config
+        shell: bash
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+        run: |
+          set -Eeuo pipefail
+
+          read MIN_SIZE DESIRED_CAPACITY MAX_SIZE <<< "$(aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].[MinSize,DesiredCapacity,MaxSize]" \
+            --output text)"
+
+          if [ -z "${MIN_SIZE:-}" ] || [ "$MIN_SIZE" = "None" ]; then
+            echo "ASG를 찾지 못했습니다: $ASG_NAME"
+            exit 1
+          fi
+
+          echo "ASG 용량: Min=$MIN_SIZE Desired=$DESIRED_CAPACITY Max=$MAX_SIZE"
+
+          # 현재 실습 환경의 기대값을 검증만 하고 변경하지 않음
+          if [ "$MIN_SIZE" -ne 2 ] || [ "$DESIRED_CAPACITY" -lt 2 ] || [ "$MAX_SIZE" -ne 4 ]; then
+            echo "::warning::현재 ASG 용량이 실습 기준(최소 2 / 기본 2 / 최대 4)과 다릅니다."
+          fi
+
+          echo "min_size=$MIN_SIZE" >> "$GITHUB_OUTPUT"
+          echo "desired_capacity=$DESIRED_CAPACITY" >> "$GITHUB_OUTPUT"
+          echo "max_size=$MAX_SIZE" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # ASG에 현재 InService 상태인 EC2 전체 조회
+      # CPU 정책으로 3~4대까지 Scale-out된 상태여도 전체를 찾는다.
+      # ----------------------------------------------------------
+      - name: Find current ASG instances
+        id: asg_instances
+        shell: bash
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+        run: |
+          set -Eeuo pipefail
+
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
+            --output text)
+
+          if [ -z "$INSTANCE_IDS" ] || [ "$INSTANCE_IDS" = "None" ]; then
+            echo "ASG에서 InService EC2를 찾지 못했습니다."
+            exit 1
+          fi
+
+          INSTANCE_COUNT=$(wc -w <<< "$INSTANCE_IDS")
+
+          echo "현재 ASG EC2: $INSTANCE_IDS"
+          echo "현재 ASG EC2 수: $INSTANCE_COUNT"
+
+          echo "instance_ids=$INSTANCE_IDS" >> "$GITHUB_OUTPUT"
+          echo "instance_count=$INSTANCE_COUNT" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 현재 인스턴스 중 한 대를 대표 작업 서버로 사용
+      # ----------------------------------------------------------
+      - name: Select primary EC2
+        id: primary_instance
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.asg_instances.outputs.instance_ids }}
+        run: |
+          set -Eeuo pipefail
+
+          PRIMARY_INSTANCE_ID=$(awk '{print $1}' <<< "$INSTANCE_IDS")
+
+          if [ -z "$PRIMARY_INSTANCE_ID" ]; then
+            echo "대표 EC2를 선택하지 못했습니다."
+            exit 1
+          fi
+
+          echo "대표 EC2: $PRIMARY_INSTANCE_ID"
+          echo "instance_id=$PRIMARY_INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 운영 .env 생성
+      # ----------------------------------------------------------
+      - name: Build production environment file
+        id: production_env
+        shell: bash
+        env:
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DJANGO_DEBUG: ${{ secrets.DJANGO_DEBUG }}
+          DJANGO_ALLOWED_HOSTS: ${{ secrets.DJANGO_ALLOWED_HOSTS }}
+
+          DB_ENGINE: ${{ secrets.DB_ENGINE }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+
+          STATIC_URL: ${{ secrets.STATIC_URL }}
+          STATIC_ROOT: ${{ secrets.STATIC_ROOT }}
+          MEDIA_ROOT: ${{ secrets.MEDIA_ROOT }}
+        run: |
+          set -Eeuo pipefail
+
+          REQUIRED_SECRETS=(
+            DJANGO_SECRET_KEY
+            DJANGO_DEBUG
+            DJANGO_ALLOWED_HOSTS
+            DB_ENGINE
+            DB_NAME
+            DB_USER
+            DB_PASSWORD
+            DB_HOST
+            DB_PORT
+            STATIC_URL
+            STATIC_ROOT
+            MEDIA_ROOT
+          )
+
+          for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
+            if [ -z "${!SECRET_NAME:-}" ]; then
+              echo "필수 GitHub Secret이 비어 있습니다: $SECRET_NAME"
+              exit 1
+            fi
+          done
+
+          python <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          groups = [
+              (
+                  "# Django",
+                  [
+                      "DJANGO_SECRET_KEY",
+                      "DJANGO_DEBUG",
+                      "DJANGO_ALLOWED_HOSTS",
+                  ],
+              ),
+              (
+                  "# MariaDB",
+                  [
+                      "DB_ENGINE",
+                      "DB_NAME",
+                      "DB_USER",
+                      "DB_PASSWORD",
+                      "DB_HOST",
+                      "DB_PORT",
+                  ],
+              ),
+              (
+                  "# Static / Media",
+                  [
+                      "STATIC_URL",
+                      "STATIC_ROOT",
+                      "MEDIA_ROOT",
+                  ],
+              ),
+          ]
+
+          lines = []
+
+          for title, keys in groups:
+              lines.append(title)
+              for key in keys:
+                  lines.append(f"{key}={json.dumps(os.environ[key])}")
+              lines.append("")
+
+          Path("/tmp/production.env").write_text(
+              "\n".join(lines),
+              encoding="utf-8",
+          )
+          PY
+
+          ENV_BASE64=$(base64 -w 0 /tmp/production.env)
+
+          echo "::add-mask::$ENV_BASE64"
+          echo "base64=$ENV_BASE64" >> "$GITHUB_OUTPUT"
+
+          rm -f /tmp/production.env
+
+      # ----------------------------------------------------------
+      # 현재 ASG EC2 전체에 새 코드/.env/EFS 설정 적용
+      # ----------------------------------------------------------
+      - name: Update application on current ASG instances
+        id: update_application
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.asg_instances.outputs.instance_ids }}
+          PRODUCTION_ENV_BASE64: ${{ steps.production_env.outputs.base64 }}
+          EFS_ENDPOINT: ${{ secrets.EFS_ENDPOINT }}
+        run: |
+          set -Eeuo pipefail
+
+          read -r -d '' REMOTE_SCRIPT <<SCRIPT || true
+          set -Eeuo pipefail
+
+          PROJECT_DIR="$PROJECT_DIR"
+          VENV_DIR="$VENV_DIR"
+          GIT_REPOSITORY="$GIT_REPOSITORY"
+          GUNICORN_SERVICE="$GUNICORN_SERVICE"
+          EFS_ENDPOINT="$EFS_ENDPOINT"
+          EFS_MOUNT_POINT="$EFS_MOUNT_POINT"
+          ENV_FILE="\$PROJECT_DIR/.env"
+
+          echo "========================================"
+          echo "서버: \$(hostname)"
+          echo "Django 애플리케이션 갱신"
+          echo "========================================"
+
+          if ! command -v mount.nfs4 >/dev/null 2>&1; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common
+          fi
+
+          mkdir -p "\$EFS_MOUNT_POINT"
+
+          EFS_HOST="\${EFS_ENDPOINT%%:*}"
+          EFS_SOURCE="\${EFS_HOST}:/"
+          FSTAB_OPTIONS="nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev,nofail,x-systemd.automount"
+          FSTAB_ENTRY="\$EFS_SOURCE \$EFS_MOUNT_POINT nfs4 \$FSTAB_OPTIONS 0 0"
+
+          cp /etc/fstab "/etc/fstab.backup.\$(date +%Y%m%d%H%M%S)"
+          sed -i "\|[[:space:]]\$EFS_MOUNT_POINT[[:space:]]|d" /etc/fstab
+          printf '%s\n' "\$FSTAB_ENTRY" >> /etc/fstab
+
+          systemctl daemon-reload
+
+          if ! mountpoint -q "\$EFS_MOUNT_POINT"; then
+            mount "\$EFS_MOUNT_POINT"
+          fi
+
+          if ! mountpoint -q "\$EFS_MOUNT_POINT"; then
+            echo "EFS 마운트 실패"
+            exit 1
+          fi
+
+          mkdir -p "/etc/systemd/system/\$GUNICORN_SERVICE.service.d"
+
+          cat > "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf" <<EOF_SYSTEMD
+          [Unit]
+          Wants=network-online.target remote-fs.target
+          After=network-online.target remote-fs.target
+          RequiresMountsFor=\$EFS_MOUNT_POINT
+          EOF_SYSTEMD
+
+          systemctl daemon-reload
+
+          if [ ! -d "\$PROJECT_DIR/.git" ]; then
+            echo "Git 프로젝트가 없습니다: \$PROJECT_DIR"
+            exit 1
+          fi
+
+          if [ ! -x "\$VENV_DIR/bin/python" ]; then
+            echo "Python 가상환경이 없습니다: \$VENV_DIR"
+            exit 1
+          fi
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" remote set-url origin "\$GIT_REPOSITORY"
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" fetch --prune origin
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" reset --hard
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" clean -fd \
+              -e .env \
+              -e media/ \
+              -e staticfiles/
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" checkout -B main origin/main
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" reset --hard origin/main
+
+          printf '%s' "$PRODUCTION_ENV_BASE64" \
+            | base64 --decode \
+            > "\$ENV_FILE"
+
+          chown ubuntu:ubuntu "\$ENV_FILE"
+          chmod 600 "\$ENV_FILE"
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" \
+            -m pip install --upgrade pip
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/pip" \
+            install -r "\$PROJECT_DIR/requirements.txt"
+
+          cd "\$PROJECT_DIR"
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" \
+            manage.py check --deploy
+
+          findmnt "\$EFS_MOUNT_POINT"
+
+          echo "Git Commit:"
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" rev-parse HEAD
+          SCRIPT
+
+          PARAMETERS=$(jq -n \
+            --arg command "$REMOTE_SCRIPT" \
+            '{commands: [$command]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids $INSTANCE_IDS \
+            --document-name "AWS-RunShellScript" \
+            --comment "Update mysite on current ASG instances" \
+            --timeout-seconds 1200 \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Verify application update
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.asg_instances.outputs.instance_ids }}
+          COMMAND_ID: ${{ steps.update_application.outputs.command_id }}
+        run: |
+          set -Eeuo pipefail
+
+          FAILED=0
+
+          for INSTANCE_ID in $INSTANCE_IDS; do
+            if ! aws ssm wait command-executed \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID"; then
+              FAILED=1
+            fi
+
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text)
+
+            echo "$INSTANCE_ID: $STATUS"
+
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "StandardOutputContent" \
+              --output text || true
+
+            if [ "$STATUS" != "Success" ]; then
+              FAILED=1
+
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardErrorContent" \
+                --output text || true
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # 대표 서버 한 대에서 DB migration / collectstatic / S3 sync
+      # ----------------------------------------------------------
+      - name: Migrate database and publish static files
+        id: publish_static
+        shell: bash
+        env:
+          PRIMARY_INSTANCE_ID: ${{ steps.primary_instance.outputs.instance_id }}
+        run: |
+          set -Eeuo pipefail
+
+          read -r -d '' REMOTE_SCRIPT <<SCRIPT || true
+          set -Eeuo pipefail
+
+          PROJECT_DIR="$PROJECT_DIR"
+          VENV_DIR="$VENV_DIR"
+          S3_STATIC_URI="$S3_STATIC_URI"
+
+          cd "\$PROJECT_DIR"
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" manage.py migrate --noinput
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" manage.py collectstatic --noinput --clear
+
+          STATIC_DIR=\$(sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" manage.py shell -c \
+            "from django.conf import settings; print(settings.STATIC_ROOT)" \
+            | tail -n 1 | tr -d '\r')
+
+          if [ ! -d "\$STATIC_DIR" ]; then
+            echo "정적 파일 디렉터리가 없습니다: \$STATIC_DIR"
+            exit 1
+          fi
+
+          aws s3 sync \
+            "\$STATIC_DIR/" \
+            "\$S3_STATIC_URI/" \
+            --delete
+
+          echo "DB migration / collectstatic / S3 sync 완료"
+          SCRIPT
+
+          PARAMETERS=$(jq -n \
+            --arg command "$REMOTE_SCRIPT" \
+            '{commands: [$command]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$PRIMARY_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Migrate DB and publish static files" \
+            --timeout-seconds 1200 \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Verify migration and static deployment
+        shell: bash
+        env:
+          PRIMARY_INSTANCE_ID: ${{ steps.primary_instance.outputs.instance_id }}
+          COMMAND_ID: ${{ steps.publish_static.outputs.command_id }}
+        run: |
+          set -Eeuo pipefail
+
+          aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$PRIMARY_INSTANCE_ID" || true
+
+          STATUS=$(aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$PRIMARY_INSTANCE_ID" \
+            --query "Status" \
+            --output text)
+
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$PRIMARY_INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text || true
+
+          if [ "$STATUS" != "Success" ]; then
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$PRIMARY_INSTANCE_ID" \
+              --query "StandardErrorContent" \
+              --output text || true
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # 현재 ASG 인스턴스 전체 Gunicorn 재시작
+      # ----------------------------------------------------------
+      - name: Restart Gunicorn
+        id: restart_gunicorn
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.asg_instances.outputs.instance_ids }}
+        run: |
+          set -Eeuo pipefail
+
+          read -r -d '' REMOTE_SCRIPT <<SCRIPT || true
+          set -Eeuo pipefail
+          systemctl restart "$GUNICORN_SERVICE"
+          sleep 3
+          systemctl is-active --quiet "$GUNICORN_SERVICE"
+          SCRIPT
+
+          PARAMETERS=$(jq -n \
+            --arg command "$REMOTE_SCRIPT" \
+            '{commands: [$command]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids $INSTANCE_IDS \
+            --document-name "AWS-RunShellScript" \
+            --comment "Restart mysite Gunicorn" \
+            --timeout-seconds 300 \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Gunicorn
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.asg_instances.outputs.instance_ids }}
+          COMMAND_ID: ${{ steps.restart_gunicorn.outputs.command_id }}
+        run: |
+          set -Eeuo pipefail
+
+          FAILED=0
+
+          for INSTANCE_ID in $INSTANCE_IDS; do
+            aws ssm wait command-executed \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" || true
+
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text)
+
+            echo "$INSTANCE_ID: $STATUS"
+
+            if [ "$STATUS" != "Success" ]; then
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # 대표 EC2로 Release AMI 생성
+      # ----------------------------------------------------------
+      - name: Create release AMI
+        id: create_ami
+        shell: bash
+        env:
+          PRIMARY_INSTANCE_ID: ${{ steps.primary_instance.outputs.instance_id }}
+        run: |
+          set -Eeuo pipefail
+
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
+          AMI_NAME="mysite-${SHORT_SHA}-${TIMESTAMP}"
+
+          AMI_ID=$(aws ec2 create-image \
+            --region "$AWS_REGION" \
+            --instance-id "$PRIMARY_INSTANCE_ID" \
+            --name "$AMI_NAME" \
+            --description "mysite release ${GITHUB_SHA}" \
+            --no-reboot \
+            --tag-specifications \
+              "ResourceType=image,Tags=[{Key=Project,Value=mysite},{Key=Environment,Value=production},{Key=GitCommit,Value=${GITHUB_SHA}}]" \
+            --query "ImageId" \
+            --output text)
+
+          echo "새 AMI: $AMI_ID"
+          echo "AMI available 상태 대기"
+
+          aws ec2 wait image-available \
+            --region "$AWS_REGION" \
+            --image-ids "$AMI_ID"
+
+          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+          echo "ami_name=$AMI_NAME" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 현재 ASG가 사용 중인 Launch Template 버전 확인
+      # ----------------------------------------------------------
+      - name: Resolve current Launch Template version
+        id: current_lt
+        shell: bash
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+          LAUNCH_TEMPLATE_ID: ${{ secrets.LAUNCH_TEMPLATE_ID }}
+        run: |
+          set -Eeuo pipefail
+
+          ASG_LT_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId" \
+            --output text)
+
+          ASG_LT_VERSION=$(aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].LaunchTemplate.Version" \
+            --output text)
+
+          if [ "$ASG_LT_ID" != "$LAUNCH_TEMPLATE_ID" ]; then
+            echo "ASG Launch Template과 Secret 값이 다릅니다."
+            echo "ASG: $ASG_LT_ID"
+            echo "Secret: $LAUNCH_TEMPLATE_ID"
+            exit 1
+          fi
+
+          SOURCE_VERSION=$(aws ec2 describe-launch-template-versions \
+            --region "$AWS_REGION" \
+            --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+            --versions "$ASG_LT_VERSION" \
+            --query "LaunchTemplateVersions[0].VersionNumber" \
+            --output text)
+
+          echo "현재 Launch Template version: $SOURCE_VERSION"
+          echo "version=$SOURCE_VERSION" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 기존 Launch Template 설정을 그대로 상속하고
+      # AMI만 새 Release AMI로 변경한 새 버전 생성
+      # ----------------------------------------------------------
+      - name: Create new Launch Template version
+        id: new_lt
+        shell: bash
+        env:
+          LAUNCH_TEMPLATE_ID: ${{ secrets.LAUNCH_TEMPLATE_ID }}
+          SOURCE_VERSION: ${{ steps.current_lt.outputs.version }}
+          AMI_ID: ${{ steps.create_ami.outputs.ami_id }}
+        run: |
+          set -Eeuo pipefail
+
+          LT_DATA=$(jq -n \
+            --arg image_id "$AMI_ID" \
+            '{ImageId: $image_id}')
+
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --region "$AWS_REGION" \
+            --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+            --source-version "$SOURCE_VERSION" \
+            --version-description "GitHub ${GITHUB_SHA}" \
+            --launch-template-data "$LT_DATA" \
+            --query "LaunchTemplateVersion.VersionNumber" \
+            --output text)
+
+          echo "새 Launch Template version: $NEW_VERSION"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # ASG의 Launch Template 버전만 변경
+      #
+      # Min=2 / Desired=2 / Max=4 및 CPU 30% Target Tracking
+      # 정책은 변경하지 않는다.
+      # ----------------------------------------------------------
+      - name: Update ASG Launch Template
+        shell: bash
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+          LAUNCH_TEMPLATE_ID: ${{ secrets.LAUNCH_TEMPLATE_ID }}
+          NEW_VERSION: ${{ steps.new_lt.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+
+          aws autoscaling update-auto-scaling-group \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --launch-template \
+              "LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$NEW_VERSION"
+
+      # ----------------------------------------------------------
+      # ASG Instance Refresh
+      #
+      # 현재 ASG:
+      # Min=2 / Desired=2 / Max=4
+      #
+      # MinHealthyPercentage=100
+      #   -> 기존 2대 중 Healthy 2대 유지
+      #
+      # MaxHealthyPercentage=200
+      #   -> Desired=2 기준 최대 4대까지 허용
+      #   -> 새 인스턴스를 먼저 생성한 뒤 기존 인스턴스 교체
+      #
+      # InstanceWarmup=10
+      #   -> 현재 Target Tracking 설정의 warmup 값과 맞춤
+      # ----------------------------------------------------------
+      - name: Start ASG Instance Refresh
+        id: refresh
+        shell: bash
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+        run: |
+          set -Eeuo pipefail
+
+          PREFERENCES=$(jq -n \
+            '{
+              MinHealthyPercentage: 100,
+              MaxHealthyPercentage: 200,
+              InstanceWarmup: 10,
+              SkipMatching: true,
+              AutoRollback: true
+            }')
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences "$PREFERENCES" \
+            --query "InstanceRefreshId" \
+            --output text)
+
+          echo "Instance Refresh ID: $REFRESH_ID"
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # Instance Refresh 완료 대기
+      # ----------------------------------------------------------
+      - name: Wait for ASG Instance Refresh
+        shell: bash
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+          REFRESH_ID: ${{ steps.refresh.outputs.refresh_id }}
+        run: |
+          set -Eeuo pipefail
+
+          for ATTEMPT in $(seq 1 120); do
+            read STATUS PERCENT <<< "$(aws autoscaling describe-instance-refreshes \
+              --region "$AWS_REGION" \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].[Status,PercentageComplete]" \
+              --output text)"
+
+            echo "[$ATTEMPT/120] 상태=$STATUS 진행률=${PERCENT}%"
+
+            case "$STATUS" in
+              Successful)
+                echo "ASG 롤링 업데이트 완료"
+                exit 0
+                ;;
+              Failed|Cancelled|RollbackFailed)
+                echo "Instance Refresh 실패: $STATUS"
+
+                aws autoscaling describe-instance-refreshes \
+                  --region "$AWS_REGION" \
+                  --auto-scaling-group-name "$ASG_NAME" \
+                  --instance-refresh-ids "$REFRESH_ID" \
+                  --query "InstanceRefreshes[0].[StatusReason,PercentageComplete]" \
+                  --output text || true
+
+                exit 1
+                ;;
+            esac
+
+            sleep 30
+          done
+
+          echo "Instance Refresh 완료 대기 시간 초과"
+          exit 1
+
+      # ----------------------------------------------------------
+      # 최종 ASG 상태 확인
+      # Target Tracking에 의해 최종 Desired는 2~4 사이일 수 있다.
+      # ----------------------------------------------------------
+      - name: Verify final ASG state
+        id: final_asg
+        shell: bash
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+        run: |
+          set -Eeuo pipefail
+
+          read MIN_SIZE DESIRED_CAPACITY MAX_SIZE <<< "$(aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].[MinSize,DesiredCapacity,MaxSize]" \
+            --output text)"
+
+          FINAL_INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
+            --output text)
+
+          FINAL_COUNT=$(wc -w <<< "$FINAL_INSTANCE_IDS")
+
+          echo "ASG 용량: Min=$MIN_SIZE Desired=$DESIRED_CAPACITY Max=$MAX_SIZE"
+          echo "InService EC2: $FINAL_INSTANCE_IDS"
+          echo "InService EC2 수: $FINAL_COUNT"
+
+          echo "desired_capacity=$DESIRED_CAPACITY" >> "$GITHUB_OUTPUT"
+          echo "instance_count=$FINAL_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Deployment summary
+        env:
+          AMI_ID: ${{ steps.create_ami.outputs.ami_id }}
+          AMI_NAME: ${{ steps.create_ami.outputs.ami_name }}
+          LT_VERSION: ${{ steps.new_lt.outputs.version }}
+          REFRESH_ID: ${{ steps.refresh.outputs.refresh_id }}
+          DESIRED_CAPACITY: ${{ steps.final_asg.outputs.desired_capacity }}
+          FINAL_COUNT: ${{ steps.final_asg.outputs.instance_count }}
+        run: |
+          {
+            echo "## Mysite ASG 배포 완료"
+            echo
+            echo "- Django 테스트: 성공"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- 새 AMI: \`${AMI_ID}\` (\`${AMI_NAME}\`)"
+            echo "- Launch Template version: \`${LT_VERSION}\`"
+            echo "- Instance Refresh: \`${REFRESH_ID}\`"
+            echo "- ASG Min / Default / Max: 2 / 2 / 4"
+            echo "- Target Tracking: 평균 CPU 30%"
+            echo "- Target Tracking Warmup: 10초"
+            echo "- 현재 Desired Capacity: ${DESIRED_CAPACITY}"
+            echo "- 현재 InService EC2: ${FINAL_COUNT}대"
+            echo "- DB migration: 완료"
+            echo "- collectstatic / S3 sync: 완료"
+            echo "- ASG 롤링 교체: 완료"
+          } >> "$GITHUB_STEP_SUMMARY"
