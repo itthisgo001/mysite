@@ -397,6 +397,12 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common
           fi
 
+          if [ -e "\$EFS_MOUNT_POINT" ] && [ ! -d "\$EFS_MOUNT_POINT" ]; then
+            echo "EFS 마운트 경로가 디렉터리가 아닙니다: \$EFS_MOUNT_POINT"
+            ls -ld "\$EFS_MOUNT_POINT"
+            exit 1
+          fi
+
           mkdir -p "\$EFS_MOUNT_POINT"
 
           EFS_HOST="\${EFS_ENDPOINT%%:*}"
@@ -410,14 +416,28 @@ jobs:
 
           systemctl daemon-reload
 
-          if ! mountpoint -q "\$EFS_MOUNT_POINT"; then
-            mount "\$EFS_MOUNT_POINT"
+          # x-systemd.automount 사용:
+          # 여기서는 수동 mount를 실행하지 않는다.
+          # 경로에 실제 접근하는 시점에 systemd가 자동 마운트를 수행한다.
+          AUTOMOUNT_UNIT="\$(systemd-escape --path "\$EFS_MOUNT_POINT").automount"
+
+          echo "EFS automount unit 확인: \$AUTOMOUNT_UNIT"
+
+          if systemctl list-unit-files "\$AUTOMOUNT_UNIT" >/dev/null 2>&1; then
+            systemctl start "\$AUTOMOUNT_UNIT" || true
           fi
 
+          # automount 트리거용 경로 접근
+          ls "\$EFS_MOUNT_POINT" >/dev/null
+
           if ! mountpoint -q "\$EFS_MOUNT_POINT"; then
-            echo "EFS 마운트 실패"
+            echo "EFS automount 실패: \$EFS_SOURCE -> \$EFS_MOUNT_POINT"
+            systemctl status "\$AUTOMOUNT_UNIT" --no-pager || true
+            findmnt "\$EFS_MOUNT_POINT" || true
             exit 1
           fi
+
+          findmnt "\$EFS_MOUNT_POINT"
 
           mkdir -p "/etc/systemd/system/\$GUNICORN_SERVICE.service.d"
 
@@ -1285,6 +1305,7 @@ jobs:
             echo "- DesiredConfiguration 적용: 완료"
             echo "- AutoRollback: 활성"
             echo "- Gunicorn/EFS 부팅 의존성: 비차단 구성"
+            echo "- EFS 마운트 방식: x-systemd.automount (수동 mount 미사용)"
             echo "- SSM 결과 확인: 최대 20분 polling 방식"
             echo "- ASG 롤링 교체: 완료"
           } >> "$GITHUB_STEP_SUMMARY"
