@@ -828,47 +828,33 @@ jobs:
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
       # ----------------------------------------------------------
-      # ASG의 Launch Template 버전만 변경
-      #
-      # Min=2 / Desired=2 / Max=4 및 CPU 30% Target Tracking
-      # 정책은 변경하지 않는다.
-      # ----------------------------------------------------------
-      - name: Update ASG Launch Template
-        shell: bash
-        env:
-          ASG_NAME: ${{ secrets.ASG_NAME }}
-          LAUNCH_TEMPLATE_ID: ${{ secrets.LAUNCH_TEMPLATE_ID }}
-          NEW_VERSION: ${{ steps.new_lt.outputs.version }}
-        run: |
-          set -Eeuo pipefail
-
-          aws autoscaling update-auto-scaling-group \
-            --region "$AWS_REGION" \
-            --auto-scaling-group-name "$ASG_NAME" \
-            --launch-template \
-              "LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$NEW_VERSION"
-
-      # ----------------------------------------------------------
       # ASG Instance Refresh
       #
       # 현재 ASG:
       # Min=2 / Desired=2 / Max=4
       #
+      # DesiredConfiguration에 새 Launch Template 버전을 직접 전달한다.
+      # 따라서 별도의 UpdateAutoScalingGroup 단계는 사용하지 않는다.
+      #
       # MinHealthyPercentage=100
-      #   -> 기존 2대 중 Healthy 2대 유지
+      #   -> 기존 정상 인스턴스를 유지하면서 교체
       #
       # MaxHealthyPercentage=200
       #   -> Desired=2 기준 최대 4대까지 허용
-      #   -> 새 인스턴스를 먼저 생성한 뒤 기존 인스턴스 교체
+      #
+      # AutoRollback=true
+      #   -> Refresh 실패 시 이전 ASG 구성으로 자동 롤백
       #
       # InstanceWarmup=10
-      #   -> 현재 Target Tracking 설정의 warmup 값과 맞춤
+      #   -> 현재 실습 ASG의 warmup 값과 맞춤
       # ----------------------------------------------------------
       - name: Start ASG Instance Refresh
         id: refresh
         shell: bash
         env:
           ASG_NAME: ${{ secrets.ASG_NAME }}
+          LAUNCH_TEMPLATE_ID: ${{ secrets.LAUNCH_TEMPLATE_ID }}
+          NEW_VERSION: ${{ steps.new_lt.outputs.version }}
         run: |
           set -Eeuo pipefail
 
@@ -881,13 +867,32 @@ jobs:
               AutoRollback: true
             }')
 
+          DESIRED_CONFIGURATION=$(jq -n \
+            --arg lt_id "$LAUNCH_TEMPLATE_ID" \
+            --arg version "$NEW_VERSION" \
+            '{
+              LaunchTemplate: {
+                LaunchTemplateId: $lt_id,
+                Version: $version
+              }
+            }')
+
+          echo "새 Launch Template version: $NEW_VERSION"
+          echo "DesiredConfiguration을 사용하여 Instance Refresh를 시작합니다."
+
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --region "$AWS_REGION" \
             --auto-scaling-group-name "$ASG_NAME" \
             --strategy Rolling \
+            --desired-configuration "$DESIRED_CONFIGURATION" \
             --preferences "$PREFERENCES" \
             --query "InstanceRefreshId" \
             --output text)
+
+          if [ -z "$REFRESH_ID" ] || [ "$REFRESH_ID" = "None" ]; then
+            echo "Instance Refresh 시작에 실패했습니다."
+            exit 1
+          fi
 
           echo "Instance Refresh ID: $REFRESH_ID"
           echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
@@ -995,5 +1000,7 @@ jobs:
             echo "- 현재 InService EC2: ${FINAL_COUNT}대"
             echo "- DB migration: 완료"
             echo "- collectstatic / S3 sync: 완료"
+            echo "- DesiredConfiguration 적용: 완료"
+            echo "- AutoRollback: 활성"
             echo "- ASG 롤링 교체: 완료"
           } >> "$GITHUB_STEP_SUMMARY"
