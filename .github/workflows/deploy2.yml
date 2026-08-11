@@ -444,6 +444,12 @@ jobs:
           if [ -f "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf" ]; then
             echo "Gunicorn EFS drop-in:"
             cat "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf"
+
+            if grep -q "RequiresMountsFor" "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf"; then
+              echo "RequiresMountsFor가 남아 있습니다."
+              echo "AMI에서 해당 설정을 제거한 뒤 새 AMI를 생성해야 합니다."
+              exit 1
+            fi
           else
             echo "Gunicorn EFS drop-in 없음: 정상"
           fi
@@ -921,6 +927,20 @@ jobs:
         run: |
           set -Eeuo pipefail
 
+          # 인스턴스 타입 재정의(MixedInstancesPolicy/Overrides)는 사용하지 않는다.
+          MIXED_POLICY=$(aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].MixedInstancesPolicy" \
+            --output json)
+
+          if [ "$MIXED_POLICY" != "null" ] && [ -n "$MIXED_POLICY" ]; then
+            echo "ASG에 MixedInstancesPolicy가 설정되어 있습니다."
+            echo "이 워크플로는 Launch Template의 InstanceType만 사용합니다."
+            echo "ASG에서 인스턴스 타입 재정의를 제거한 뒤 다시 실행하세요."
+            exit 1
+          fi
+
           ASG_LT_ID=$(aws autoscaling describe-auto-scaling-groups \
             --region "$AWS_REGION" \
             --auto-scaling-group-names "$ASG_NAME" \
@@ -932,6 +952,11 @@ jobs:
             --auto-scaling-group-names "$ASG_NAME" \
             --query "AutoScalingGroups[0].LaunchTemplate.Version" \
             --output text)
+
+          if [ -z "$ASG_LT_ID" ] || [ "$ASG_LT_ID" = "None" ]; then
+            echo "ASG에 직접 연결된 Launch Template을 찾지 못했습니다."
+            exit 1
+          fi
 
           if [ "$ASG_LT_ID" != "$LAUNCH_TEMPLATE_ID" ]; then
             echo "ASG Launch Template과 Secret 값이 다릅니다."
@@ -947,8 +972,25 @@ jobs:
             --query "LaunchTemplateVersions[0].VersionNumber" \
             --output text)
 
+          LT_INSTANCE_TYPE=$(aws ec2 describe-launch-template-versions \
+            --region "$AWS_REGION" \
+            --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+            --versions "$SOURCE_VERSION" \
+            --query "LaunchTemplateVersions[0].LaunchTemplateData.InstanceType" \
+            --output text)
+
+          if [ -z "$LT_INSTANCE_TYPE" ] || [ "$LT_INSTANCE_TYPE" = "None" ]; then
+            echo "Launch Template에 InstanceType이 없습니다."
+            exit 1
+          fi
+
+          echo "현재 Launch Template ID: $ASG_LT_ID"
           echo "현재 Launch Template version: $SOURCE_VERSION"
+          echo "Launch Template InstanceType: $LT_INSTANCE_TYPE"
+          echo "ASG InstanceType override: 사용 안 함"
+
           echo "version=$SOURCE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "instance_type=$LT_INSTANCE_TYPE" >> "$GITHUB_OUTPUT"
 
       # ----------------------------------------------------------
       # 기존 Launch Template 설정을 그대로 상속하고
@@ -960,10 +1002,13 @@ jobs:
         env:
           LAUNCH_TEMPLATE_ID: ${{ secrets.LAUNCH_TEMPLATE_ID }}
           SOURCE_VERSION: ${{ steps.current_lt.outputs.version }}
+          SOURCE_INSTANCE_TYPE: ${{ steps.current_lt.outputs.instance_type }}
           AMI_ID: ${{ steps.create_ami.outputs.ami_id }}
         run: |
           set -Eeuo pipefail
 
+          # 기존 LT 버전을 그대로 상속하고 ImageId만 변경한다.
+          # InstanceType은 변경하거나 재정의하지 않는다.
           LT_DATA=$(jq -n \
             --arg image_id "$AMI_ID" \
             '{ImageId: $image_id}')
@@ -977,8 +1022,24 @@ jobs:
             --query "LaunchTemplateVersion.VersionNumber" \
             --output text)
 
+          NEW_INSTANCE_TYPE=$(aws ec2 describe-launch-template-versions \
+            --region "$AWS_REGION" \
+            --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+            --versions "$NEW_VERSION" \
+            --query "LaunchTemplateVersions[0].LaunchTemplateData.InstanceType" \
+            --output text)
+
+          if [ "$NEW_INSTANCE_TYPE" != "$SOURCE_INSTANCE_TYPE" ]; then
+            echo "Launch Template InstanceType이 변경되었습니다."
+            echo "기존: $SOURCE_INSTANCE_TYPE"
+            echo "신규: $NEW_INSTANCE_TYPE"
+            exit 1
+          fi
+
           echo "새 Launch Template version: $NEW_VERSION"
+          echo "InstanceType 유지: $NEW_INSTANCE_TYPE"
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "instance_type=$NEW_INSTANCE_TYPE" >> "$GITHUB_OUTPUT"
 
       # ----------------------------------------------------------
       # ASG Instance Refresh
@@ -1001,6 +1062,27 @@ jobs:
       # InstanceWarmup=10
       #   -> 현재 실습 ASG의 warmup 값과 맞춤
       # ----------------------------------------------------------
+      - name: Verify no instance type overrides
+        shell: bash
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+        run: |
+          set -Eeuo pipefail
+
+          MIXED_POLICY=$(aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].MixedInstancesPolicy" \
+            --output json)
+
+          if [ "$MIXED_POLICY" != "null" ] && [ -n "$MIXED_POLICY" ]; then
+            echo "Instance Refresh 직전에 MixedInstancesPolicy가 감지되었습니다."
+            echo "ASG에서 인스턴스 타입 재정의를 제거하세요."
+            exit 1
+          fi
+
+          echo "ASG InstanceType override 없음: 정상"
+
       - name: Start ASG Instance Refresh
         id: refresh
         shell: bash
@@ -1291,6 +1373,7 @@ jobs:
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- 새 AMI: \`${AMI_ID}\` (\`${AMI_NAME}\`)"
             echo "- Launch Template version: \`${LT_VERSION}\`"
+            echo "- 인스턴스 타입: Launch Template 값 그대로 사용 (ASG Override 없음)"
             echo "- Instance Refresh: \`${REFRESH_ID}\`"
             echo "- ASG Min / Default / Max: 2 / 2 / 4"
             echo "- Target Tracking: 평균 CPU 30%"
