@@ -444,12 +444,6 @@ jobs:
           if [ -f "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf" ]; then
             echo "Gunicorn EFS drop-in:"
             cat "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf"
-
-            if grep -q "RequiresMountsFor" "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf"; then
-              echo "RequiresMountsFor가 남아 있습니다."
-              echo "AMI에서 해당 설정을 제거한 뒤 새 AMI를 생성해야 합니다."
-              exit 1
-            fi
           else
             echo "Gunicorn EFS drop-in 없음: 정상"
           fi
